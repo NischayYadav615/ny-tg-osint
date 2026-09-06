@@ -1,4 +1,4 @@
-# api.py — Full-featured Telegram search API (ICMR-style) for Vercel
+# api.py — Full-featured Telegram search for Kzr0xx/telegram on Vercel
 import asyncio
 import json
 import os
@@ -13,11 +13,13 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
 # ── Config ──────────────────────────────────────────────────────────
-# URL to your pre-built DuckDB file on Hugging Face
-DB_URL = os.environ.get(
-    "TG_DB_URL",
-    "https://huggingface.co/yourusername/telegram_db/resolve/main/telegram.duckdb"
-)
+# Direct URLs to the 4 Parquet files in Kzr0xx/telegram
+PARQUET_URLS = [
+    "https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main/TGDATA%20BY%20DEADLOX%20P1.parquet",
+    "https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main/TGDATA%20BY%20DEADLOX%20P2.parquet",
+    "https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main/TGDATA%20BY%20DEADLOX%20P3.parquet",
+    "https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main/TGDATA%20BY%20DEADLOX%20P4.parquet",
+]
 
 SEARCH_FIELDS = [
     "user_id", "username", "first_name", "last_name",
@@ -26,11 +28,11 @@ SEARCH_FIELDS = [
 ]
 NUMBER_FIELDS = ["user_id", "phone"]
 
-PARALLELISM = int(os.environ.get("TG_PARALLEL", "1"))      # Vercel: keep low
+PARALLELISM = int(os.environ.get("TG_PARALLEL", "1"))      # Vercel: 1 thread
 THREADS_PER_CONN = int(os.environ.get("TG_THREADS", "1"))
 DUPLICATE_CAP = 2
 
-# ── DuckDB Connection Pool (thread‑local) ──────────────────────
+# ── DuckDB Connection Pool ──────────────────────────────────────
 _conns: List[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
@@ -41,10 +43,14 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
     # Vercel: use /tmp for extensions
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
+    con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Attach remote DB read‑only
-    con.execute(f"ATTACH '{DB_URL}' AS tg (READ_ONLY)")
+    # Create a view over all remote Parquet files
+    file_list = ", ".join(f"'{url}'" for url in PARQUET_URLS)
+    con.execute(f"CREATE OR REPLACE VIEW tg_view AS SELECT * FROM read_parquet([{file_list}])")
+    # Optimizations for Vercel's limited resources
     con.execute(f"SET threads = {THREADS_PER_CONN}")
+    con.execute("SET memory_limit = '512MB'")
     return con
 
 def _thread_id() -> int:
@@ -62,7 +68,7 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
             _conns.append(_new_conn())
     return _conns[ident]
 
-# ── Dedup & helpers ──────────────────────────────────────────────
+# ── Dedup ────────────────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
     uid = (row.get("user_id") or "").strip()
     ph = (row.get("phone") or "").strip()
@@ -88,12 +94,10 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     v = value.replace("'", "''")
 
     if mode == "exact":
-        # Exact match on any field – uses index for user_id and phone
-        sql = f"SELECT * FROM tg.tg WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+        sql = f"SELECT * FROM tg_view WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
     elif mode == "contains":
-        # Contains search – only efficient for phone (due to index) but works for all
         v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM tg.tg WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
+        sql = f"SELECT * FROM tg_view WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -112,11 +116,10 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     if is_num:
         all_rows = []
         searched = []
-        # Try user_id first (indexed)
-        if True:  # always available
-            r = _run_field_search("user_id", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("user_id")
+        # Try user_id first
+        r = _run_field_search("user_id", q, "exact", limit)
+        all_rows.extend(r["results"])
+        searched.append("user_id")
         # If none, try phone exact
         if not all_rows:
             r = _run_field_search("phone", q, "exact", limit)
@@ -135,29 +138,29 @@ def _unified_search(q: str, limit: int = 10) -> dict:
             "results": all_rows
         }
     else:
-        # Text search across multiple fields (no index – scan)
+        # Text search across multiple fields (scan, but limited)
         text_fields = ["username", "first_name", "last_name", "email", "linked_name", "linked_handle"]
         conditions = []
         for f in text_fields:
             v = q.replace("'", "''")
             conditions.append(f"{f} ILIKE '%{v}%'")
-        sql = f"SELECT * FROM tg.tg WHERE {' OR '.join(conditions)} LIMIT {limit}"
+        sql = f"SELECT * FROM tg_view WHERE {' OR '.join(conditions)} LIMIT {limit}"
         con = _get_conn()
         rows = con.execute(sql).fetchall()
         cols = [d[0] for d in con.description]
         results = [dict(zip(cols, r)) for r in rows]
         return {"query": q, "searched_fields": text_fields, "count": len(results), "results": results}
 
-# ── FastAPI App ──────────────────────────────────────────────────
+# ── FastAPI ──────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm up a connection (optional, to avoid first‑request latency)
+    # Warm up a connection on startup (to reduce first‑request latency)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(pool, _get_conn)
     yield
 
 fastapi_app = FastAPI(
-    title="Telegram Search API",
+    title="Telegram Search (Kzr0xx/telegram)",
     description="Full‑featured search over 1.65B Telegram records",
     lifespan=lifespan
 )
@@ -170,6 +173,7 @@ class BatchRequest(BaseModel):
 def root():
     return {
         "app": "Telegram Search API",
+        "dataset": "Kzr0xx/telegram",
         "records": "~1.65B",
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
@@ -180,7 +184,7 @@ def root():
 def health():
     try:
         con = _get_conn()
-        count = con.execute("SELECT COUNT(*) FROM tg.tg").fetchone()[0]
+        count = con.execute("SELECT COUNT(*) FROM tg_view").fetchone()[0]
         return {"status": "ok", "records": count}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -300,9 +304,9 @@ def build_ui():
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
 
-**Source:** [AnyJobHub/telegram](https://huggingface.co/datasets/AnyJobHub/telegram)
+**Source:** [Kzr0xx/telegram](https://huggingface.co/datasets/Kzr0xx/telegram)
             """)
-        gr.Markdown("---\n<div style='text-align:center;color:#888;'>👨‍💻 Deployed on Vercel with DuckDB + remote index</div>")
+        gr.Markdown("---\n<div style='text-align:center;color:#888;'>👨‍💻 Deployed on Vercel with DuckDB + remote Parquet</div>")
     return demo
 
 demo = build_ui()
