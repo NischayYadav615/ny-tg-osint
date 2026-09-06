@@ -1,4 +1,4 @@
-# api.py — ICMR-style Telegram search (partitioned indexes)
+# api.py — Full-featured Telegram search API (ICMR-style) for Vercel
 import asyncio
 import json
 import os
@@ -12,15 +12,12 @@ import gradio as gr
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
-# ── Config ──────────────────────────────────────────────────────
-HF_INDEX_BASE = os.environ.get(
-    "TG_HF_INDEX_BASE",
-    "https://huggingface.co/datasets/yourusername/telegram_index/resolve/main",
-).rstrip("/")
-
-PARALLELISM = int(os.environ.get("TG_PARALLEL", "1"))   # Vercel: keep low
-THREADS_PER_CONN = int(os.environ.get("TG_THREADS", "1"))
-DUPLICATE_CAP = 2
+# ── Config ──────────────────────────────────────────────────────────
+# URL to your pre-built DuckDB file on Hugging Face
+DB_URL = os.environ.get(
+    "TG_DB_URL",
+    "https://huggingface.co/yourusername/telegram_db/resolve/main/telegram.duckdb"
+)
 
 SEARCH_FIELDS = [
     "user_id", "username", "first_name", "last_name",
@@ -29,16 +26,11 @@ SEARCH_FIELDS = [
 ]
 NUMBER_FIELDS = ["user_id", "phone"]
 
-# Remote index files (6 partitions each)
-REMOTE_INDEXES = {
-    "user_id": [f"{HF_INDEX_BASE}/idx_user_id.{i}.parquet" for i in range(6)],
-    "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(6)],
-}
+PARALLELISM = int(os.environ.get("TG_PARALLEL", "1"))      # Vercel: keep low
+THREADS_PER_CONN = int(os.environ.get("TG_THREADS", "1"))
+DUPLICATE_CAP = 2
 
-def _idx_ready(kind: str) -> bool:
-    return kind in REMOTE_INDEXES
-
-# ── DuckDB Connection Pool ────────────────────────────────────
+# ── DuckDB Connection Pool (thread‑local) ──────────────────────
 _conns: List[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
@@ -46,15 +38,12 @@ pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
+    # Vercel: use /tmp for extensions
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Create views for each index
-    for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
-        lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
+    # Attach remote DB read‑only
+    con.execute(f"ATTACH '{DB_URL}' AS tg (READ_ONLY)")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
@@ -73,7 +62,7 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
             _conns.append(_new_conn())
     return _conns[ident]
 
-# ── Dedup & helpers ────────────────────────────────────────────
+# ── Dedup & helpers ──────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
     uid = (row.get("user_id") or "").strip()
     ph = (row.get("phone") or "").strip()
@@ -92,28 +81,19 @@ def _cap_duplicates(rows: List[dict]) -> List[dict]:
             out.append(r)
     return out
 
-# ── Search Logic ────────────────────────────────────────────────
+# ── Search Logic ──────────────────────────────────────────────────
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
     v = value.replace("'", "''")
 
     if mode == "exact":
-        if field == "user_id" and _idx_ready("user_id"):
-            view = "people_user_id"
-        elif field == "phone" and _idx_ready("phone"):
-            view = "people_phone"
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+        # Exact match on any field – uses index for user_id and phone
+        sql = f"SELECT * FROM tg.tg WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
     elif mode == "contains":
-        # For contains, we can only use the phone index (or fallback to scan)
-        if field == "phone" and _idx_ready("phone"):
-            view = "people_phone"
-            v2 = v.replace("%", r"\%").replace("_", r"\_")
-            sql = f"SELECT * FROM {view} WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        # Contains search – only efficient for phone (due to index) but works for all
+        v2 = v.replace("%", r"\%").replace("_", r"\_")
+        sql = f"SELECT * FROM tg.tg WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -128,21 +108,22 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     if not q:
         return {"query": q, "count": 0, "results": []}
     is_num = q.isdigit() and len(q) >= 5
+
     if is_num:
         all_rows = []
         searched = []
-        # Try user_id first (fastest)
-        if _idx_ready("user_id"):
+        # Try user_id first (indexed)
+        if True:  # always available
             r = _run_field_search("user_id", q, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("user_id")
-        # If not found, try phone
-        if not all_rows and _idx_ready("phone"):
+        # If none, try phone exact
+        if not all_rows:
             r = _run_field_search("phone", q, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("phone")
-        # If still nothing, try contains on phone
-        if not all_rows and _idx_ready("phone"):
+        # If still none, try contains on phone
+        if not all_rows:
             r = _run_field_search("phone", q, "contains", limit)
             all_rows.extend(r["results"])
             searched.append("phone(contains)")
@@ -154,33 +135,30 @@ def _unified_search(q: str, limit: int = 10) -> dict:
             "results": all_rows
         }
     else:
-        # Text search: scan all text fields (slow, but we rarely use it)
-        # We'll limit aggressively.
+        # Text search across multiple fields (no index – scan)
         text_fields = ["username", "first_name", "last_name", "email", "linked_name", "linked_handle"]
         conditions = []
         for f in text_fields:
             v = q.replace("'", "''")
             conditions.append(f"{f} ILIKE '%{v}%'")
-        if not conditions:
-            return {"query": q, "count": 0, "results": []}
-        sql = f"SELECT * FROM people_user_id WHERE {' OR '.join(conditions)} LIMIT {limit}"
+        sql = f"SELECT * FROM tg.tg WHERE {' OR '.join(conditions)} LIMIT {limit}"
         con = _get_conn()
         rows = con.execute(sql).fetchall()
         cols = [d[0] for d in con.description]
         results = [dict(zip(cols, r)) for r in rows]
         return {"query": q, "searched_fields": text_fields, "count": len(results), "results": results}
 
-# ── FastAPI + Lifespan ──────────────────────────────────────────
+# ── FastAPI App ──────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm up one connection (only if needed)
+    # Warm up a connection (optional, to avoid first‑request latency)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(pool, _get_conn)
     yield
 
 fastapi_app = FastAPI(
-    title="Telegram Search (ICMR-style)",
-    description="Partitioned indexes for user_id and phone",
+    title="Telegram Search API",
+    description="Full‑featured search over 1.65B Telegram records",
     lifespan=lifespan
 )
 
@@ -193,14 +171,19 @@ def root():
     return {
         "app": "Telegram Search API",
         "records": "~1.65B",
-        "indexes": {"user_id": _idx_ready("user_id"), "phone": _idx_ready("phone")},
         "columns": SEARCH_FIELDS,
-        "docs": "/docs"
+        "docs": "/docs",
+        "developer": "@NischayYadav615"
     }
 
 @fastapi_app.get("/health")
 def health():
-    return {"status": "ok", "indexes": {"user_id": _idx_ready("user_id"), "phone": _idx_ready("phone")}}
+    try:
+        con = _get_conn()
+        count = con.execute("SELECT COUNT(*) FROM tg.tg").fetchone()[0]
+        return {"status": "ok", "records": count}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 @fastapi_app.get("/search")
 async def search(
@@ -247,8 +230,18 @@ async def search_parallel(req: BatchRequest):
         media_type="application/json"
     )
 
-# ── Gradio UI (optional) ────────────────────────────────────────
-# Keep it minimal to avoid extra load, but include for consistency
+@fastapi_app.get("/user/{user_id}")
+async def get_user_by_id(user_id: str):
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(pool, _run_field_search, "user_id", user_id, "exact", 1)
+    if data.get("count", 0) == 0:
+        raise HTTPException(404, f"User {user_id} not found")
+    return Response(
+        content=json.dumps(data["results"][0], indent=2, ensure_ascii=False),
+        media_type="application/json"
+    )
+
+# ── Gradio UI ────────────────────────────────────────────────────
 def format_result(row: dict) -> str:
     lines = []
     for field in SEARCH_FIELDS:
@@ -259,7 +252,7 @@ def format_result(row: dict) -> str:
 
 def search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
-        return "⚠️ Enter a query (user_id, phone, name, etc.)"
+        return "⚠️ Please enter a search query (user_id, phone, name, etc.)"
     q = query.strip()
     try:
         data = _unified_search(q, int(limit))
@@ -269,7 +262,7 @@ def search_ui(query: str, limit: int) -> str:
     results = data.get("results", [])
     searched = ", ".join(data.get("searched_fields", []))
     if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ No results."
+        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ No results found."
     header = f"🔍 **Query:** `{q}`  |  **Found:** {count}  |  **Searched:** {searched}\n\n---\n\n"
     parts = []
     for i, row in enumerate(results, 1):
@@ -277,18 +270,39 @@ def search_ui(query: str, limit: int) -> str:
     return header + "\n\n---\n\n".join(parts)
 
 def build_ui():
-    with gr.Blocks(title="Telegram Search") as demo:
-        gr.Markdown("# 🔍 Telegram Search (ICMR-style)")
+    with gr.Blocks(title="Telegram Search", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🔍 Telegram User Search")
+        gr.Markdown("Search **1.65 billion** Telegram records — user_id, phone, name, username & more")
         with gr.Row():
             with gr.Column(scale=3):
-                query_input = gr.Textbox(label="Search", placeholder="user_id, phone, name...", lines=1)
+                query_input = gr.Textbox(
+                    label="Search Query",
+                    placeholder="user_id, phone number, name, or username...",
+                    lines=1
+                )
             with gr.Column(scale=1):
-                limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
-        search_btn = gr.Button("🔍 Search", variant="primary")
+                limit_slider = gr.Slider(
+                    minimum=1, maximum=50, value=10, step=1,
+                    label="Max Results"
+                )
+        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
         output = gr.Markdown(label="Results")
         search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
         query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
-        gr.Markdown("---\n**Source:** Partitioned indexes on Hugging Face")
+        gr.Markdown("---")
+        with gr.Accordion("📡 API Info", open=False):
+            gr.Markdown("""
+**Endpoints:**
+- `GET /search?q=<query>` — Auto‑detect search
+- `GET /search?field=user_id&q=123` — Field‑specific search
+- `GET /user/{user_id}` — Fast lookup by user_id
+- `POST /search/parallel` — Batch search (max 50)
+- `GET /health` — Health check
+- `GET /docs` — Swagger UI
+
+**Source:** [AnyJobHub/telegram](https://huggingface.co/datasets/AnyJobHub/telegram)
+            """)
+        gr.Markdown("---\n<div style='text-align:center;color:#888;'>👨‍💻 Deployed on Vercel with DuckDB + remote index</div>")
     return demo
 
 demo = build_ui()
